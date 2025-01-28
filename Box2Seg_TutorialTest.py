@@ -4,109 +4,97 @@ import numpy as np
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
 import torch
 import os
+import time
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-image = cv2.cvtColor(cv2.imread('/Users/simone/Documents/UofT MSc/CaltechFishCounting/nushagak/images/RB_Nusagak_Sonar_Files_2018_RB_2018-08-06_171000_6300_6600_71.jpg'), cv2.COLOR_BGR2RGB)
-# Convert to RGB (pseudo-color)
-#image = cv2.applyColorMap(image, cv2.COLORMAP_JET)
+# Use GPU if available, otherwise use CPU
+device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+
+# Load the SAM model
 sam_checkpoint = "/Users/simone/Documents/UofT MSc/CaltechFishCounting/sam_vit_h_4b8939.pth"  # SAM checkpoint file
 model_type = "vit_h"
 sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
 sam.to(device=device)
 predictor = SamPredictor(sam)
-predictor.set_image(image)
 
-#label_file = os.path('/Users/simone/Documents/UofT MSc/CaltechFishCounting/nushagak/labels/RB_Nusagak_Sonar_Files_2018_RB_2018-07-02_211000_900_1200_0.txt')
-with open('/Users/simone/Documents/UofT MSc/CaltechFishCounting/nushagak/labels/RB_Nusagak_Sonar_Files_2018_RB_2018-08-06_171000_6300_6600_71.txt', "r") as f:
-    lines = f.readlines()
+# Set the image and label paths
+images_path = '/Users/simone/Documents/UofT MSc/CaltechFishCounting/nushagak/images/'
+labels_path = '/Users/simone/Documents/UofT MSc/CaltechFishCounting/nushagak/labels/'
+seg_labels_path = '/Users/simone/Documents/UofT MSc/CaltechFishCounting/nushagak/seg_labels/'
+failed_bbox_masks_path = '/Users/simone/Documents/UofT MSc/CaltechFishCounting/nushagak/failed_bbox_masks.txt'
+os.makedirs(seg_labels_path, exist_ok=True)
 
-buffer = 5  # Adjust the buffer size as needed (in pixels)
+# Get all image files in the directory and sort them alphanumerically
+image_files = sorted([f for f in os.listdir(images_path) if f.endswith(".jpg")])
 
-# Generate masks for each bounding box
-bounding_boxes = []
-for line in lines:
-    parts = line.strip().split()
-    _, x_center, y_center, width, height = map(float, parts)
-    x_min = (x_center - width / 2) * image.shape[1]
-    y_min = (y_center - height / 2) * image.shape[0]
-    x_max = (x_center + width / 2) * image.shape[1]
-    y_max = (y_center + height / 2) * image.shape[0]
+# Filter out files that already have masks
+image_files_to_process = [f for f in image_files if not os.path.exists(os.path.join(seg_labels_path, os.path.splitext(f)[0] + "_mask_0.png"))]
+total_files = len(image_files_to_process)
+
+# Start the timer
+start_time = time.time()
+
+# Crate masks for each image in a loop
+for idx, img_file in enumerate(image_files_to_process):
+    image_path = os.path.join(images_path, img_file)
+    label_file = os.path.join(labels_path, os.path.splitext(img_file)[0] + ".txt")
+    seg_label_file = os.path.join(seg_labels_path, os.path.splitext(img_file)[0] + "_mask.png")
     
-    # Apply buffer while clamping to image bounds
-    x_min = max(0, x_min - buffer)
-    y_min = max(0, y_min - buffer)
-    x_max = min(image.shape[1], x_max + buffer)
-    y_max = min(image.shape[0], y_max + buffer)
+    # Skip image if the mask already exists
+    if os.path.exists(seg_label_file):
+        print(f"Mask for {img_file} already exists, skipping...")
+        continue
+
+    # Read the image
+    image = cv2.imread(image_path)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
+    predictor.set_image(image)
+
+    # Read the label file
+    if not os.path.exists(label_file):
+        print(f"No labels found for {img_file}, skipping...")
+        continue
+    with open(label_file, "r") as f:
+        lines = f.readlines()
+
+    # Generate masks for each bounding box
+    bounding_boxes = []
+    for line in lines:
+        parts = line.strip().split()
+        _, x_center, y_center, width, height = map(float, parts)
+        x_min = (x_center - width / 2) * image.shape[1]
+        y_min = (y_center - height / 2) * image.shape[0]
+        x_max = (x_center + width / 2) * image.shape[1]
+        y_max = (y_center + height / 2) * image.shape[0]
+        bounding_boxes.append([x_min, y_min, x_max, y_max])
     
-    bounding_boxes.append([x_min, y_min, x_max, y_max])
+    input_boxes = torch.tensor(bounding_boxes, device=device)
+    transformed_boxes = predictor.transform.apply_boxes_torch(input_boxes, image.shape[:2])
+    masks, _, _ = predictor.predict_torch(
+        point_coords=None,
+        point_labels=None,
+        boxes=transformed_boxes,
+        multimask_output=False,
+    )
 
-print(f"Bounding boxes: {bounding_boxes}")
+    # Save the masks and track failed bounding boxes
+    with open(failed_bbox_masks_path, "a") as failed_file:
+        for i, mask in enumerate(masks):
+            if mask.any():  # Check if the mask is not all False
+                mask_np = (mask.squeeze().cpu().numpy() * 255).astype(np.uint8)
+                mask_path = os.path.join(seg_labels_path, f"{os.path.splitext(img_file)[0]}_mask_{i}.png")
+                cv2.imwrite(mask_path, mask_np)
+                print(f"Saved mask to {mask_path}")
+            else:
+                failed_file.write(f"{os.path.splitext(img_file)[0]}_mask_{i}\n")
+                print(f"Failed to create mask for {os.path.splitext(img_file)[0]}_mask_{i}")
 
-def show_box(boxes, ax):
-    for box in boxes:
-        x0, y0 = box[0], box[1]
-        w, h = box[2] - box[0], box[3] - box[1]
-        ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0,0,0,0), lw=2))
-                
-plt.figure(figsize=(10, 10))
-plt.imshow(image)
-#show_mask(masks[0], plt.gca())
-show_box(bounding_boxes, plt.gca())
-plt.axis('off')
-plt.show()
+    # Calculate elapsed time
+    elapsed_time = time.time() - start_time
+    elapsed_time_str = time.strftime("%H:%M:%S", time.gmtime(elapsed_time))
 
-# input_boxes = torch.tensor(bounding_boxes, device=device)
-# transformed_boxes = predictor.transform.apply_boxes_torch(input_boxes, image.shape[:2])
-# print(f"Transformed Boxes: {transformed_boxes}")
-# masks, _, _ = predictor.predict_torch(
-#     point_coords=None,
-#     point_labels=None,
-#     boxes=transformed_boxes,
-#     multimask_output=False
-# )
-# print(f"Masks: {masks}")
+    print(f"Processed {img_file}")
+    print(f"Processed {idx + 1}/{total_files} files")
+    print(f"Elapsed time: {elapsed_time_str}")
 
-input_boxes = torch.tensor(bounding_boxes, device=device)
-transformed_boxes = predictor.transform.apply_boxes_torch(input_boxes, image.shape[:2])
-masks, _, _ = predictor.predict_torch(
-    point_coords=None,
-    point_labels=None,
-    boxes=transformed_boxes,
-    multimask_output=False,
-)
-
-
-# # Check if any entries in the masks tensor are not False
-# if masks.any().item():
-#     print("There are entries in the masks tensor that are not False.")
-# else:
-#     print("All entries in the masks tensor are False.")
-
-# # Find and print the indices of the tensors that have entries that are not False
-# non_false_indices = [i for i, tensor in enumerate(masks) if tensor.any().item()]
-# print(f"Indices of tensors with entries that are not False: {non_false_indices}")
-
-# # Print the tensors that have entries that are not False
-# for i in non_false_indices:
-#     print(f"Tensor at index {i} with entries that are not False:")
-#     print(masks[i])
-
-# Plot the image and masks overlayed
-plt.figure(figsize=(10, 10))
-plt.imshow(image)  # Show the background image
-
-# Plot each mask as an overlay
-for mask in masks:
-    if mask.any():  # Ensure the mask isn't just all False
-        mask_np = mask.squeeze().cpu().numpy()
-        rgba_mask = np.zeros((mask_np.shape[0], mask_np.shape[1], 4), dtype=np.uint8)
-        rgba_mask[..., 0] = 255  # Red channel
-        rgba_mask[..., 3] = mask_np * 255  # Alpha channel based on mask values
-        plt.imshow(rgba_mask, alpha=0.3)  # Transparent mask overlay
-
-plt.axis('off')
-show_box(bounding_boxes, plt.gca())
-plt.title("Image with Masks Overlayed")
-plt.show()
-
+print("Processing complete.")
 
