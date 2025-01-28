@@ -6,7 +6,9 @@ import torch
 import os
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-image = cv2.cvtColor(cv2.imread('/Users/simone/Documents/UofT MSc/CaltechFishCounting/nushagak 2/RB_Nusagak_Sonar_Files_2018_RB_2018-08-06_171000_6300_6600_71.jpg'), cv2.COLOR_BGR2RGB)
+image = cv2.cvtColor(cv2.imread('/Users/simone/Documents/UofT MSc/CaltechFishCounting/nushagak/images/RB_Nusagak_Sonar_Files_2018_RB_2018-08-06_171000_6300_6600_71.jpg'), cv2.COLOR_BGR2RGB)
+# Convert to RGB (pseudo-color)
+#image = cv2.applyColorMap(image, cv2.COLORMAP_JET)
 sam_checkpoint = "/Users/simone/Documents/UofT MSc/CaltechFishCounting/sam_vit_h_4b8939.pth"  # SAM checkpoint file
 model_type = "vit_h"
 sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
@@ -18,6 +20,8 @@ predictor.set_image(image)
 with open('/Users/simone/Documents/UofT MSc/CaltechFishCounting/nushagak/labels/RB_Nusagak_Sonar_Files_2018_RB_2018-08-06_171000_6300_6600_71.txt', "r") as f:
     lines = f.readlines()
 
+buffer = 5  # Adjust the buffer size as needed (in pixels)
+
 # Generate masks for each bounding box
 bounding_boxes = []
 for line in lines:
@@ -27,6 +31,13 @@ for line in lines:
     y_min = (y_center - height / 2) * image.shape[0]
     x_max = (x_center + width / 2) * image.shape[1]
     y_max = (y_center + height / 2) * image.shape[0]
+    
+    # Apply buffer while clamping to image bounds
+    x_min = max(0, x_min - buffer)
+    y_min = max(0, y_min - buffer)
+    x_max = min(image.shape[1], x_max + buffer)
+    y_max = min(image.shape[0], y_max + buffer)
+    
     bounding_boxes.append([x_min, y_min, x_max, y_max])
 
 print(f"Bounding boxes: {bounding_boxes}")
@@ -64,4 +75,38 @@ masks, _, _ = predictor.predict_torch(
     multimask_output=False,
 )
 
-print(f"Masks: {masks}")
+
+# # Check if any entries in the masks tensor are not False
+# if masks.any().item():
+#     print("There are entries in the masks tensor that are not False.")
+# else:
+#     print("All entries in the masks tensor are False.")
+
+# # Find and print the indices of the tensors that have entries that are not False
+# non_false_indices = [i for i, tensor in enumerate(masks) if tensor.any().item()]
+# print(f"Indices of tensors with entries that are not False: {non_false_indices}")
+
+# # Print the tensors that have entries that are not False
+# for i in non_false_indices:
+#     print(f"Tensor at index {i} with entries that are not False:")
+#     print(masks[i])
+
+# Plot the image and masks overlayed
+plt.figure(figsize=(10, 10))
+plt.imshow(image)  # Show the background image
+
+# Plot each mask as an overlay
+for mask in masks:
+    if mask.any():  # Ensure the mask isn't just all False
+        mask_np = mask.squeeze().cpu().numpy()
+        rgba_mask = np.zeros((mask_np.shape[0], mask_np.shape[1], 4), dtype=np.uint8)
+        rgba_mask[..., 0] = 255  # Red channel
+        rgba_mask[..., 3] = mask_np * 255  # Alpha channel based on mask values
+        plt.imshow(rgba_mask, alpha=0.3)  # Transparent mask overlay
+
+plt.axis('off')
+show_box(bounding_boxes, plt.gca())
+plt.title("Image with Masks Overlayed")
+plt.show()
+
+
